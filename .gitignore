@@ -1,0 +1,5 @@
+outputs
+scenes/*
+*.pdf
+.vscode
+__pycache__/
