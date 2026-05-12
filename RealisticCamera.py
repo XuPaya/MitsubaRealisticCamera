@@ -7,26 +7,11 @@ import drjit as dr
 import mitsuba as mi
 import numpy as np
 
-from utils import (
-    Bounds2,
-    LensElement,
-    aperture_lookup_np,
-    aperture_lookup_vec,
-    compute_cardinal_points,
-    get_property,
-    intersect_spherical_element,
-    intersect_spherical_element_np,
-    intersect_spherical_element_vec,
-    load_lens_file,
-    make_aperture_image,
-    normalize,
-    radical_inverse,
-    refract,
-    refract_np,
-    refract_vec,
-    RAY_T_EPSILON,
-    resolve_file,
-)
+import os
+
+from utils import *
+
+from glass_dictionary import sellmeier_ior
 
 
 class RealisticCamera(mi.Sensor):
@@ -53,7 +38,8 @@ class RealisticCamera(mi.Sensor):
         self.aperture = str(get_property(props, ("aperture", "aperture_image"), ""))
 
         self.aperture_image = make_aperture_image(self.aperture, self.lens_file.parent)
-        self.elements = self._make_elements(load_lens_file(self.lens_file))
+        # self.legacy_elements = self._make_elements(load_lens_file(self.lens_file))
+        self.elements = self._load_elements(self.lens_file)
 
         film_size = self.film().size()
         self.full_resolution = (int(film_size.x), int(film_size.y))
@@ -75,7 +61,7 @@ class RealisticCamera(mi.Sensor):
         if self.debug_lens_trace:
             print(self.to_string())
 
-    def _make_elements(self, lens_parameters: list[float]) -> list[LensElement]:
+    def _make_elements(self, lens_parameters: list[float]) -> list[LensElementLegacy]:
         elements = []
         set_aperture = self.aperture_diameter * self.mm_to_world
         for i in range(0, len(lens_parameters), 4):
@@ -91,7 +77,7 @@ class RealisticCamera(mi.Sensor):
                     )
                 else:
                     aperture_diameter = set_aperture
-            elements.append(LensElement(curvature_radius, thickness, eta, 0.5 * aperture_diameter))
+            elements.append(LensElementLegacy(curvature_radius, thickness, eta, 0.5 * aperture_diameter))
         return elements
 
     def _prepare_jit_tables(self):
@@ -109,6 +95,47 @@ class RealisticCamera(mi.Sensor):
             if self.aperture_image is not None
             else None
         )
+    
+    def _load_elements(self, filename: str | os.PathLike) -> list[LensElement]:
+        
+        lens_parameters = []
+        with open(filename, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, 1):
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                parts = line.replace(",", " ").split()
+                if len(parts) != 4:
+                    raise ValueError(f"{filename}:{line_no}: expected 4 values per line, got {len(parts)}")
+                lens_parameters.append(float(parts[0])) # curvature radius
+                lens_parameters.append(float(parts[1])) # thickness
+                try: 
+                    eta_value = float(parts[2])
+                    lens_parameters.append(Eta_lookup({"type": "constant", "value": eta_value})) # eta value
+                except ValueError:
+                    lens_parameters.append(Eta_lookup({"type": "glass", "glass_name": parts[2]})) # eta name
+                lens_parameters.append(float(parts[3])) # aperture diameter
+        if not lens_parameters or len(lens_parameters) % 4:
+            raise ValueError(f"{filename}: lens files must contain groups of four floats")
+    
+        elements = []
+        set_aperture = self.aperture_diameter * self.mm_to_world
+        for i in range(0, len(lens_parameters), 4):
+            curvature_radius = lens_parameters[i] * self.mm_to_world
+            thickness = lens_parameters[i + 1] * self.mm_to_world
+            eta = lens_parameters[i + 2] # Eta_lookup object
+            aperture_diameter = lens_parameters[i + 3] * self.mm_to_world
+            if curvature_radius == 0:
+                if set_aperture > aperture_diameter:
+                    warnings.warn(
+                        f"aperture_diameter {self.aperture_diameter:g} mm exceeds "
+                        f"lens stop {aperture_diameter / self.mm_to_world:g} mm; clamping"
+                    )
+                else:
+                    aperture_diameter = set_aperture
+                
+            elements.append(LensElement(curvature_radius, thickness, eta, 0.5 * aperture_diameter))
+        return elements
 
     def lens_rear_z(self) -> float:
         return self.elements[-1].thickness
@@ -160,8 +187,8 @@ class RealisticCamera(mi.Sensor):
 
             ox, oy, oz = hx, hy, hz
             if not is_stop:
-                eta_i = element.eta
-                eta_t = self.elements[i - 1].eta if i > 0 and self.elements[i - 1].eta else 1.0
+                eta_i = element.eta(None)
+                eta_t = self.elements[i - 1].eta(None) if i > 0 and self.elements[i - 1].eta(None)>0.0 else 1.0
                 wt = refract(normalize((-dx, -dy, -dz)), n, eta_t / eta_i)
                 if wt is None:
                     return 0.0, None, None
@@ -196,8 +223,8 @@ class RealisticCamera(mi.Sensor):
                 return 0.0, None, None
             ox, oy, oz = hx, hy, hz
             if not is_stop:
-                eta_i = self.elements[i - 1].eta if i > 0 and self.elements[i - 1].eta else 1.0
-                eta_t = element.eta if element.eta else 1.0
+                eta_i = self.elements[i - 1].eta(None) if i > 0 and self.elements[i - 1].eta(None)>0.0 else 1.0
+                eta_t = element.eta(None) if element.eta(None)>0.0 else 1.0
                 wt = refract(normalize((-dx, -dy, -dz)), n, eta_t / eta_i)
                 if wt is None:
                     return 3.0, None, None
@@ -267,6 +294,7 @@ class RealisticCamera(mi.Sensor):
                 ry,
                 np.full_like(pfx, self.lens_rear_z()),
             )
+            
             if np.any(active):
                 bound.min_x = min(bound.min_x, float(np.min(rx[active])))
                 bound.min_y = min(bound.min_y, float(np.min(ry[active])))
@@ -308,10 +336,13 @@ class RealisticCamera(mi.Sensor):
         inv_r = dr.select(r_film != 0, 1.0 / r_film, 0.0)
         sin_theta = pfy * inv_r
         cos_theta = dr.select(r_film != 0, pfx * inv_r, 1.0)
+        pplx = cos_theta * px - sin_theta * py
+        pply = sin_theta * px + cos_theta * py
+        pplz = dr.auto.Float(self.lens_rear_z())
         pupil = mi.Point3f(
-            cos_theta * px - sin_theta * py,
-            sin_theta * px + cos_theta * py,
-            self.lens_rear_z(),
+            pplx,
+            pply,
+            pplz,
         )
         return pupil, dr.select(area > 0.0, 1.0 / area, 0.0), area > 0.0
 
@@ -349,6 +380,9 @@ class RealisticCamera(mi.Sensor):
         return ray, ray_wav_weights * weight
 
     def _sample_ray_vec(self, time, wavelength_sample, position_sample, aperture_sample, active=True):
+        empty_si = mi.SurfaceInteraction3f()
+        ray_wavelengths, ray_wav_weights = self.sample_wavelengths(empty_si, wavelength_sample, active)
+        
         sx = (position_sample.x * self.crop_size[0] + self.crop_offset[0]) / self.full_resolution[0]
         sy = (position_sample.y * self.crop_size[1] + self.crop_offset[1]) / self.full_resolution[1]
         p2x = self.physical_extent.min_x + sx * (self.physical_extent.max_x - self.physical_extent.min_x)
@@ -356,16 +390,16 @@ class RealisticCamera(mi.Sensor):
         pfx, pfy = p2x, p2y
         pupil, pdf, pupil_ok = self._sample_exit_pupil_vec(pfx, pfy, aperture_sample)
         dfx, dfy, dfz = pupil.x - pfx, pupil.y - pfy, pupil.z
-        weight, ro, rd, lens_ok = self._trace_lenses_from_film_vec(pfx, pfy, 0.0, dfx, dfy, dfz, active & pupil_ok)
+        weight, ro, rd, lens_ok = self._trace_lenses_from_film_vec(pfx, pfy, 0.0, dfx, dfy, dfz, ray_wavelengths, active & pupil_ok)
         d_norm = dr.normalize(mi.Vector3f(dfx, dfy, dfz))
         weight *= dr.power(d_norm.z, 4.0) / (pdf * self.lens_rear_z() * self.lens_rear_z())
         weight = dr.select(lens_ok, weight, 0.0)
         
-        empty_si = mi.SurfaceInteraction3f()
-        ray_wavelengths, ray_wav_weights = self.sample_wavelengths(empty_si, wavelength_sample, active)
-        
         ray = mi.Ray3f(ro, dr.normalize(rd), time, ray_wavelengths)
         ray = self.world_transform() @ ray
+        if ray_wavelengths.shape[0] > 0: # spectral rendering enabled: ray is warped according to first sampled wavelength
+            ray_wav_weights[1:] = 0.0
+            ray_wav_weights[0] *= 4.0
         return ray, ray_wav_weights * weight
 
     def sample_ray_differential(self, time, sample1, sample2, sample3, active=True):
@@ -382,7 +416,7 @@ class RealisticCamera(mi.Sensor):
         result.has_differentials = True
         return result, weight
 
-    def _trace_lenses_from_film_vec(self, ox, oy, oz, dx, dy, dz, active):
+    def _trace_lenses_from_film_vec(self, ox, oy, oz, dx, dy, dz, ray_wavelengths, active):
         ox, oy, oz = ox, oy, -oz
         dx, dy, dz = dx, dy, -dz
         active = mi.Mask(active)
@@ -417,8 +451,12 @@ class RealisticCamera(mi.Sensor):
             ox, oy, oz = hx, hy, hz
             if not is_stop:
                 wi = dr.normalize(mi.Vector3f(-dx, -dy, -dz))
-                eta_i = element.eta
-                eta_t = self.elements[i - 1].eta if i > 0 and self.elements[i - 1].eta else 1.0
+                if ray_wavelengths.shape[0] > 0:
+                    wvl = ray_wavelengths[0]
+                else:
+                    wvl = None                
+                eta_i = element.eta(wvl)
+                eta_t = self.elements[i - 1].eta(wvl) if i > 0 and self.elements[i - 1].eta(None)>0.0 else 1.0
                 wt, refr_ok = refract_vec(wi, mi.Vector3f(nx, ny, nz), eta_t / eta_i)
                 active &= refr_ok
                 dx, dy, dz = wt.x, wt.y, wt.z
@@ -460,12 +498,14 @@ class RealisticCamera(mi.Sensor):
             if element.curvature_radius != 0:
                 inv_len = 1.0 / np.sqrt(dx * dx + dy * dy + dz * dz)
                 wi = (-dx * inv_len, -dy * inv_len, -dz * inv_len)
-                eta_i = element.eta
-                eta_t = self.elements[i - 1].eta if i > 0 and self.elements[i - 1].eta else 1.0
+                eta_i = element.eta(None)
+                eta_t = self.elements[i - 1].eta(None) if i > 0 and self.elements[i - 1].eta(None)>0.0 else 1.0
                 wt, ok = refract_np(wi, n, eta_t / eta_i)
+                
                 active &= ok
                 dx, dy, dz = wt
         return active
+
 
     def to_string(self):
         return (

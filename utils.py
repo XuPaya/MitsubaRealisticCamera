@@ -9,15 +9,23 @@ import drjit as dr
 import mitsuba as mi
 import numpy as np
 
+from glass_dictionary import Eta_lookup
+
 
 RAY_T_EPSILON = 1e-7
 
+@dataclass
+class LensElementLegacy:
+    curvature_radius: float
+    thickness: float
+    eta: float
+    aperture_radius: float
 
 @dataclass
 class LensElement:
     curvature_radius: float
     thickness: float
-    eta: float
+    eta: Eta_lookup
     aperture_radius: float
 
 
@@ -127,20 +135,25 @@ def intersect_spherical_element(radius, z_center, origin, direction):
 
 
 def refract(wi, n, eta):
+    _eta = eta
+    if type(eta) is not float:
+        _eta = eta.numpy()
+    if _eta == 0.0:
+        _eta = 1.0
     cos_theta_i = dot(n, wi)
     if cos_theta_i < 0:
-        eta = 1.0 / eta
+        _eta = 1.0 / _eta
         cos_theta_i = -cos_theta_i
         n = (-n[0], -n[1], -n[2])
     sin2_theta_i = max(0.0, 1.0 - cos_theta_i * cos_theta_i)
-    sin2_theta_t = sin2_theta_i / (eta * eta)
+    sin2_theta_t = sin2_theta_i / (_eta * _eta)
     if sin2_theta_t >= 1.0:
         return None
     cos_theta_t = math.sqrt(1.0 - sin2_theta_t)
     return (
-        -wi[0] / eta + (cos_theta_i / eta - cos_theta_t) * n[0],
-        -wi[1] / eta + (cos_theta_i / eta - cos_theta_t) * n[1],
-        -wi[2] / eta + (cos_theta_i / eta - cos_theta_t) * n[2],
+        -wi[0] / _eta + (cos_theta_i / _eta - cos_theta_t) * n[0],
+        -wi[1] / _eta + (cos_theta_i / _eta - cos_theta_t) * n[1],
+        -wi[2] / _eta + (cos_theta_i / _eta - cos_theta_t) * n[2],
     )
 
 
@@ -172,7 +185,10 @@ def intersect_spherical_element_vec(radius, z_center, ox, oy, oz, dx, dy, dz):
 def refract_vec(wi, n, eta):
     cos_i = dr.dot(n, wi)
     flip = cos_i < 0.0
-    eta_eff = dr.select(flip, 1.0 / eta, eta)
+    _eta = eta.array
+    # if eta is 0, set it to 1;
+    # _eta = dr.select(_eta == 0.0, 1.0, _eta)
+    eta_eff = dr.select(flip, 1.0 / _eta, _eta)
     cos_i = dr.select(flip, -cos_i, cos_i)
     n = dr.select(flip, -n, n)
     sin2_i = dr.maximum(0.0, 1.0 - cos_i * cos_i)
@@ -206,6 +222,8 @@ def intersect_spherical_element_np(radius, z_center, ox, oy, oz, dx, dy, dz):
 
 
 def refract_np(wi, n, eta):
+    if eta == 0.0:
+        eta = 1.0
     cos_i = n[0] * wi[0] + n[1] * wi[1] + n[2] * wi[2]
     flip = cos_i < 0.0
     eta_eff = np.where(flip, 1.0 / eta, eta)
