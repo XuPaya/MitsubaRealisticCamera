@@ -8,3 +8,4 @@ examples/scenes/kitchen/textures
 *.pdf
 .vscode
 __pycache__/
+*.egg-info/

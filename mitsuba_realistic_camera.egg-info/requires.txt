@@ -1,6 +1,0 @@
-drjit
-mitsuba
-
-[examples]
-numpy
-pillow
