@@ -1,17 +1,11 @@
 from __future__ import annotations
 
 import math
-import warnings
 
 import drjit as dr
 import mitsuba as mi
-import numpy as np
-
-import os
 
 from utils import *
-
-from glass_dictionary import sellmeier_ior
 
 
 class RealisticCamera(mi.Sensor):
@@ -38,8 +32,17 @@ class RealisticCamera(mi.Sensor):
         self.aperture = str(get_property(props, ("aperture", "aperture_image"), ""))
 
         self.aperture_image = make_aperture_image(self.aperture, self.lens_file.parent)
-        # self.legacy_elements = self._make_elements(load_lens_file(self.lens_file))
-        self.elements = self._load_elements(self.lens_file)
+        self._radical_inverse = mi.RadicalInverse(3)
+        self.elements = load_lens_elements(
+            self.lens_file,
+            self.aperture_diameter,
+            self.mm_to_world,
+        )
+        self._aperture_flat = (
+            mi.Float(self.aperture_image.flat())
+            if dr.is_jit_v(mi.Float) and self.aperture_image is not None
+            else None
+        )
 
         film_size = self.film().size()
         self.full_resolution = (int(film_size.x), int(film_size.y))
@@ -61,25 +64,6 @@ class RealisticCamera(mi.Sensor):
         if self.debug_lens_trace:
             print(self.to_string())
 
-    def _make_elements(self, lens_parameters: list[float]) -> list[LensElementLegacy]:
-        elements = []
-        set_aperture = self.aperture_diameter * self.mm_to_world
-        for i in range(0, len(lens_parameters), 4):
-            curvature_radius = lens_parameters[i] * self.mm_to_world
-            thickness = lens_parameters[i + 1] * self.mm_to_world
-            eta = lens_parameters[i + 2]
-            aperture_diameter = lens_parameters[i + 3] * self.mm_to_world
-            if curvature_radius == 0:
-                if set_aperture > aperture_diameter:
-                    warnings.warn(
-                        f"aperture_diameter {self.aperture_diameter:g} mm exceeds "
-                        f"lens stop {aperture_diameter / self.mm_to_world:g} mm; clamping"
-                    )
-                else:
-                    aperture_diameter = set_aperture
-            elements.append(LensElementLegacy(curvature_radius, thickness, eta, 0.5 * aperture_diameter))
-        return elements
-
     def _prepare_jit_tables(self):
         if not dr.is_jit_v(mi.Float):
             self._exit_min_x = self._exit_min_y = None
@@ -91,51 +75,50 @@ class RealisticCamera(mi.Sensor):
         self._exit_max_x = mi.Float([b.max_x for b in self.exit_pupil_bounds])
         self._exit_max_y = mi.Float([b.max_y for b in self.exit_pupil_bounds])
         self._aperture_flat = (
-            mi.Float(self.aperture_image.ravel().astype(np.float32))
+            mi.Float(self.aperture_image.flat())
             if self.aperture_image is not None
             else None
         )
-    
-    def _load_elements(self, filename: str | os.PathLike) -> list[LensElement]:
-        
-        lens_parameters = []
-        with open(filename, "r", encoding="utf-8") as f:
-            for line_no, line in enumerate(f, 1):
-                line = line.split("#", 1)[0].strip()
-                if not line:
-                    continue
-                parts = line.replace(",", " ").split()
-                if len(parts) != 4:
-                    raise ValueError(f"{filename}:{line_no}: expected 4 values per line, got {len(parts)}")
-                lens_parameters.append(float(parts[0])) # curvature radius
-                lens_parameters.append(float(parts[1])) # thickness
-                try: 
-                    eta_value = float(parts[2])
-                    lens_parameters.append(Eta_lookup({"type": "constant", "value": eta_value})) # eta value
-                except ValueError:
-                    lens_parameters.append(Eta_lookup({"type": "glass", "glass_name": parts[2]})) # eta name
-                lens_parameters.append(float(parts[3])) # aperture diameter
-        if not lens_parameters or len(lens_parameters) % 4:
-            raise ValueError(f"{filename}: lens files must contain groups of four floats")
-    
-        elements = []
-        set_aperture = self.aperture_diameter * self.mm_to_world
-        for i in range(0, len(lens_parameters), 4):
-            curvature_radius = lens_parameters[i] * self.mm_to_world
-            thickness = lens_parameters[i + 1] * self.mm_to_world
-            eta = lens_parameters[i + 2] # Eta_lookup object
-            aperture_diameter = lens_parameters[i + 3] * self.mm_to_world
-            if curvature_radius == 0:
-                if set_aperture > aperture_diameter:
-                    warnings.warn(
-                        f"aperture_diameter {self.aperture_diameter:g} mm exceeds "
-                        f"lens stop {aperture_diameter / self.mm_to_world:g} mm; clamping"
-                    )
-                else:
-                    aperture_diameter = set_aperture
-                
-            elements.append(LensElement(curvature_radius, thickness, eta, 0.5 * aperture_diameter))
-        return elements
+
+    def _radical_inverse_samples(self, start, end, n_samples):
+        if dr.is_jit_v(mi.Float):
+            idx = dr.arange(mi.UInt32, start, end)
+        else:
+            idx = mi.UInt32(start)
+        return (
+            self._radical_inverse.eval(0, idx),
+            self._radical_inverse.eval(1, idx),
+            (mi.Float(idx) + 0.5) / n_samples,
+        )
+
+    def _exit_bound_values(self, r_film):
+        n = len(self.exit_pupil_bounds)
+        if self._exit_min_x is not None:
+            idx = mi.UInt32(dr.minimum(mi.Float(n - 1), r_film / (self._film_diag_world * 0.5) * n))
+            return (
+                dr.gather(mi.Float, self._exit_min_x, idx),
+                dr.gather(mi.Float, self._exit_min_y, idx),
+                dr.gather(mi.Float, self._exit_max_x, idx),
+                dr.gather(mi.Float, self._exit_max_y, idx),
+                mi.Mask(True),
+            )
+
+        r_index = min(n - 1, int(scalar_value(r_film) / (self._film_diag_world * 0.5) * n))
+        bound = self.exit_pupil_bounds[r_index]
+        return bound.min_x, bound.min_y, bound.max_x, bound.max_y, not bound.is_degenerate()
+
+    def _merge_exit_bound_sample(self, bound, active, rx, ry):
+        if dr.width(active) > 1:
+            if bool(dr.any(active)):
+                bound.min_x = min(bound.min_x, float(dr.min(dr.select(active, rx, math.inf))[0]))
+                bound.min_y = min(bound.min_y, float(dr.min(dr.select(active, ry, math.inf))[0]))
+                bound.max_x = max(bound.max_x, float(dr.max(dr.select(active, rx, -math.inf))[0]))
+                bound.max_y = max(bound.max_y, float(dr.max(dr.select(active, ry, -math.inf))[0]))
+        elif bool(active):
+            bound.min_x = min(bound.min_x, scalar_value(rx))
+            bound.min_y = min(bound.min_y, scalar_value(ry))
+            bound.max_x = max(bound.max_x, scalar_value(rx))
+            bound.max_y = max(bound.max_y, scalar_value(ry))
 
     def lens_rear_z(self) -> float:
         return self.elements[-1].thickness
@@ -147,90 +130,82 @@ class RealisticCamera(mi.Sensor):
         return self.elements[-1].aperture_radius
 
     def trace_lenses_from_film(self, origin, direction):
-        ox, oy, oz = origin[0], origin[1], -origin[2]
-        dx, dy, dz = direction[0], direction[1], -direction[2]
-        element_z = 0.0
-        weight = 1.0
-
-        for i in range(len(self.elements) - 1, -1, -1):
-            element = self.elements[i]
-            element_z -= element.thickness
-            is_stop = element.curvature_radius == 0
-            if is_stop:
-                if dz == 0:
-                    return 0.0, None, None
-                t = (element_z - oz) / dz
-                if t < -RAY_T_EPSILON:
-                    return 0.0, None, None
-            else:
-                hit = intersect_spherical_element(
-                    element.curvature_radius,
-                    element_z + element.curvature_radius,
-                    (ox, oy, oz),
-                    (dx, dy, dz),
-                )
-                if hit is None:
-                    return 0.0, None, None
-                t, n = hit
-
-            hx, hy, hz = ox + t * dx, oy + t * dy, oz + t * dz
-            if is_stop and self.aperture_image is not None:
-                weight = float(aperture_lookup_np(
-                    self.aperture_image,
-                    np.array([(hx / element.aperture_radius + 1.0) * 0.5]),
-                    np.array([(hy / element.aperture_radius + 1.0) * 0.5]),
-                )[0])
-                if weight == 0:
-                    return 0.0, None, None
-            elif hx * hx + hy * hy > element.aperture_radius * element.aperture_radius:
-                return 0.0, None, None
-
-            ox, oy, oz = hx, hy, hz
-            if not is_stop:
-                eta_i = element.eta(None)
-                eta_t = self.elements[i - 1].eta(None) if i > 0 and self.elements[i - 1].eta(None)>0.0 else 1.0
-                wt = refract(normalize((-dx, -dy, -dz)), n, eta_t / eta_i)
-                if wt is None:
-                    return 0.0, None, None
-                dx, dy, dz = wt
-
-        return weight, (ox, oy, -oz), (dx, dy, -dz)
+        return self._trace_lenses(
+            origin[0], origin[1], origin[2],
+            direction[0], direction[1], direction[2],
+            from_film=True,
+        )[:3]
 
     def trace_lenses_from_scene(self, origin, direction):
-        ox, oy, oz = origin[0], origin[1], -origin[2]
-        dx, dy, dz = direction[0], direction[1], -direction[2]
-        element_z = -self.lens_front_z()
-        for i, element in enumerate(self.elements):
-            is_stop = element.curvature_radius == 0
-            if is_stop:
-                if dz == 0:
-                    return 0.0, None, None
-                t = (element_z - oz) / dz
-                if t < -RAY_T_EPSILON:
-                    return 1.0, None, None
+        return self._trace_lenses(
+            origin[0], origin[1], origin[2],
+            direction[0], direction[1], direction[2],
+            from_film=False,
+        )[:3]
+
+    def _element_eta(self, index, wavelength):
+        if index < 0 or eta_is_zero(self.elements[index].eta):
+            return 1.0
+        return eta_at(self.elements[index].eta, wavelength)
+
+    def _eta_pair(self, index, wavelength, from_film):
+        if from_film:
+            return self._element_eta(index, wavelength), self._element_eta(index - 1, wavelength)
+        return self._element_eta(index - 1, wavelength), self._element_eta(index, wavelength)
+
+    def _trace_lenses(self, ox, oy, oz, dx, dy, dz, from_film, wavelength=None, active=True):
+        origin = mi.Vector3f(ox, oy, -oz)
+        direction = mi.Vector3f(dx, dy, -dz)
+        element_z = 0.0 if from_film else -self.lens_front_z()
+        weight = mi.Float(1.0)
+        active = mi.Mask(active)
+        indices = range(len(self.elements) - 1, -1, -1) if from_film else range(len(self.elements))
+        if is_scalar_false(active):
+            return 0.0, None, None, False
+
+        for i in indices:
+            element = self.elements[i]
+            if from_film:
+                element_z -= element.thickness
+            hit_info = element.surface.intersect(element_z, origin, direction)
+            if hit_info is None:
+                return 0.0, None, None, False
+            t, normal, hit = hit_info
+
+            hit_point = origin + t * direction
+            if element.is_stop and from_film and self.aperture_image is not None:
+                u = (hit_point.x / element.aperture_radius + 1.0) * 0.5
+                v = (hit_point.y / element.aperture_radius + 1.0) * 0.5
+                if self._aperture_flat is not None:
+                    weight = aperture_lookup_vec(self.aperture_image, self._aperture_flat, u, v)
+                else:
+                    weight = aperture_lookup(self.aperture_image, u, v)
+                aperture_ok = weight != 0.0
             else:
-                hit = intersect_spherical_element(
-                    element.curvature_radius,
-                    element_z + element.curvature_radius,
-                    (ox, oy, oz),
-                    (dx, dy, dz),
+                aperture_ok = (
+                    hit_point.x * hit_point.x + hit_point.y * hit_point.y
+                    <= element.aperture_radius * element.aperture_radius
                 )
-                if hit is None:
-                    return 2.0, None, None
-                t, n = hit
-            hx, hy, hz = ox + t * dx, oy + t * dy, oz + t * dz
-            if hx * hx + hy * hy > element.aperture_radius * element.aperture_radius:
-                return 0.0, None, None
-            ox, oy, oz = hx, hy, hz
-            if not is_stop:
-                eta_i = self.elements[i - 1].eta(None) if i > 0 and self.elements[i - 1].eta(None)>0.0 else 1.0
-                eta_t = element.eta(None) if element.eta(None)>0.0 else 1.0
-                wt = refract(normalize((-dx, -dy, -dz)), n, eta_t / eta_i)
-                if wt is None:
-                    return 3.0, None, None
-                dx, dy, dz = wt
-            element_z += element.thickness
-        return 1.0, (ox, oy, -oz), (dx, dy, -dz)
+            active &= hit & aperture_ok
+            if is_scalar_false(active):
+                return 0.0, None, None, False
+
+            origin = hit_point
+            if not element.is_stop:
+                eta_i, eta_t = self._eta_pair(i, wavelength, from_film)
+                direction, refr_ok = refract_direction(dr.normalize(-direction), normal, eta_t / eta_i)
+                active &= refr_ok
+                if is_scalar_false(active):
+                    return 0.0, None, None, False
+            if not from_film:
+                element_z += element.thickness
+
+        return (
+            weight,
+            mi.Point3f(origin.x, origin.y, -origin.z),
+            mi.Vector3f(direction.x, direction.y, -direction.z),
+            active,
+        )
 
     def compute_thick_lens_approximation(self):
         x = 0.001 * self._film_diag_world
@@ -251,6 +226,8 @@ class RealisticCamera(mi.Sensor):
 
     def focus_thick_lens(self, focus_distance):
         pz, fz = self.compute_thick_lens_approximation()
+        pz = tuple(scalar_value(v) for v in pz)
+        fz = tuple(scalar_value(v) for v in fz)
         f = fz[0] - pz[0]
         z = -focus_distance
         c = (pz[1] - z - pz[0]) * (pz[1] - z - 4.0 * f - pz[0])
@@ -275,129 +252,86 @@ class RealisticCamera(mi.Sensor):
         rear_radius = self.rear_element_radius()
         proj = Bounds2(-1.5 * rear_radius, -1.5 * rear_radius, 1.5 * rear_radius, 1.5 * rear_radius)
         bound = Bounds2()
+        vectorized = dr.is_jit_v(mi.Float)
         n_samples = max(1, self.exit_pupil_sample_count)
         chunk = min(65536, n_samples)
+        if not vectorized:
+            chunk = 1
         for start in range(0, n_samples, chunk):
             end = min(start + chunk, n_samples)
-            idx = np.arange(start, end, dtype=np.uint64)
-            u0 = radical_inverse(2, idx)
-            u1 = radical_inverse(3, idx)
-            s = (idx.astype(np.float64) + 0.5) / n_samples
+            u0, u1, s = self._radical_inverse_samples(start, end, n_samples)
             pfx = film_x0 + s * (film_x1 - film_x0)
             rx = proj.min_x + u0 * (proj.max_x - proj.min_x)
             ry = proj.min_y + u1 * (proj.max_y - proj.min_y)
-            active = self._trace_lenses_from_film_np(
-                pfx,
-                np.zeros_like(pfx),
-                np.zeros_like(pfx),
-                rx - pfx,
-                ry,
-                np.full_like(pfx, self.lens_rear_z()),
+
+            _, _, _, active = self._trace_lenses(
+                pfx, mi.Float(0.0), 0.0,
+                rx - pfx, ry, mi.Float(self.lens_rear_z()),
+                from_film=True,
+                active=mi.Mask(True),
             )
-            
-            if np.any(active):
-                bound.min_x = min(bound.min_x, float(np.min(rx[active])))
-                bound.min_y = min(bound.min_y, float(np.min(ry[active])))
-                bound.max_x = max(bound.max_x, float(np.max(rx[active])))
-                bound.max_y = max(bound.max_y, float(np.max(ry[active])))
+
+            self._merge_exit_bound_sample(bound, active, rx, ry)
+        return self._expand_exit_pupil_bound(bound, proj, n_samples)
+
+    def _expand_exit_pupil_bound(self, bound, proj, n_samples):
         if bound.is_degenerate():
             return bound
         diag = math.hypot(proj.max_x - proj.min_x, proj.max_y - proj.min_y)
         return bound.expand(2.0 * diag / math.sqrt(n_samples))
 
-    def _sample_exit_pupil_scalar(self, p_film, u_lens):
-        r_film = math.hypot(p_film[0], p_film[1])
-        r_index = min(len(self.exit_pupil_bounds) - 1, int(r_film / (self._film_diag_world * 0.5) * len(self.exit_pupil_bounds)))
-        bound = self.exit_pupil_bounds[r_index]
-        if bound.is_degenerate():
-            return None, 0.0
-        px = bound.min_x + float(u_lens[0]) * (bound.max_x - bound.min_x)
-        py = bound.min_y + float(u_lens[1]) * (bound.max_y - bound.min_y)
-        sin_theta = p_film[1] / r_film if r_film != 0 else 0.0
-        cos_theta = p_film[0] / r_film if r_film != 0 else 1.0
-        pupil = (
-            cos_theta * px - sin_theta * py,
-            sin_theta * px + cos_theta * py,
-            self.lens_rear_z(),
-        )
-        return pupil, 1.0 / bound.area
-
-    def _sample_exit_pupil_vec(self, pfx, pfy, u_lens):
+    def _sample_exit_pupil(self, pfx, pfy, u_lens):
         r_film = dr.sqrt(pfx * pfx + pfy * pfy)
-        n = len(self.exit_pupil_bounds)
-        idx = mi.UInt32(dr.minimum(mi.Float(n - 1), r_film / (self._film_diag_world * 0.5) * n))
-        min_x = dr.gather(mi.Float, self._exit_min_x, idx)
-        min_y = dr.gather(mi.Float, self._exit_min_y, idx)
-        max_x = dr.gather(mi.Float, self._exit_max_x, idx)
-        max_y = dr.gather(mi.Float, self._exit_max_y, idx)
-        area = (max_x - min_x) * (max_y - min_y)
-        px = min_x + u_lens.x * (max_x - min_x)
-        py = min_y + u_lens.y * (max_y - min_y)
+        min_x, min_y, max_x, max_y, bound_ok = self._exit_bound_values(r_film)
         inv_r = dr.select(r_film != 0, 1.0 / r_film, 0.0)
         sin_theta = pfy * inv_r
         cos_theta = dr.select(r_film != 0, pfx * inv_r, 1.0)
+        area = (max_x - min_x) * (max_y - min_y)
+        px = min_x + u_lens.x * (max_x - min_x)
+        py = min_y + u_lens.y * (max_y - min_y)
         pplx = cos_theta * px - sin_theta * py
         pply = sin_theta * px + cos_theta * py
-        pplz = dr.auto.Float(self.lens_rear_z())
-        pupil = mi.Point3f(
-            pplx,
-            pply,
-            pplz,
-        )
-        return pupil, dr.select(area > 0.0, 1.0 / area, 0.0), area > 0.0
+        pupil = mi.Point3f(pplx, pply, mi.Float(self.lens_rear_z()))
+        ok = bound_ok & (area > 0.0)
+        return pupil, dr.select(ok, 1.0 / area, 0.0), ok
 
     def sample_ray(self, time, wavelength_sample, position_sample, aperture_sample, active=True):
-        if not dr.is_jit_v(mi.Float):
-            return self._sample_ray_scalar(time, wavelength_sample, position_sample, aperture_sample, active)
-        return self._sample_ray_vec(time, wavelength_sample, position_sample, aperture_sample, active)
-
-    def _sample_ray_scalar(self, time, wavelength_sample, position_sample, aperture_sample, active=True):
-        if float(position_sample.x) > 1.0 or float(position_sample.y) > 1.0:
-            sx = (float(position_sample.x) + self.crop_offset[0]) / self.full_resolution[0]
-            sy = (float(position_sample.y) + self.crop_offset[1]) / self.full_resolution[1]
-        else:
-            sx = (float(position_sample.x) * self.crop_size[0] + self.crop_offset[0]) / self.full_resolution[0]
-            sy = (float(position_sample.y) * self.crop_size[1] + self.crop_offset[1]) / self.full_resolution[1]
-        p2x = self.physical_extent.min_x + sx * (self.physical_extent.max_x - self.physical_extent.min_x)
-        p2y = self.physical_extent.min_y + sy * (self.physical_extent.max_y - self.physical_extent.min_y)
-        p_film = (p2x, p2y, 0.0)
-        p_pupil, pdf = self._sample_exit_pupil_scalar((p_film[0], p_film[1]), aperture_sample)
-        if p_pupil is None:
-            return mi.Ray3f(), mi.Spectrum(0.0)
-        d_film = (p_pupil[0] - p_film[0], p_pupil[1] - p_film[1], p_pupil[2])
-        weight, ro, rd = self.trace_lenses_from_film(p_film, d_film)
-        if weight == 0.0:
-            return mi.Ray3f(), mi.Spectrum(0.0)
-        cos_theta = normalize(d_film)[2]
-        weight *= cos_theta**4 / (pdf * self.lens_rear_z() * self.lens_rear_z())
-        rd = normalize(rd)
-        
         empty_si = mi.SurfaceInteraction3f()
         ray_wavelengths, ray_wav_weights = self.sample_wavelengths(empty_si, wavelength_sample, active)
-        
-        ray = mi.Ray3f(mi.Point3f(*ro), mi.Vector3f(*rd), float(time), ray_wavelengths)
-        ray = self.world_transform() @ ray
-        return ray, ray_wav_weights * weight
 
-    def _sample_ray_vec(self, time, wavelength_sample, position_sample, aperture_sample, active=True):
-        empty_si = mi.SurfaceInteraction3f()
-        ray_wavelengths, ray_wav_weights = self.sample_wavelengths(empty_si, wavelength_sample, active)
-        
-        sx = (position_sample.x * self.crop_size[0] + self.crop_offset[0]) / self.full_resolution[0]
-        sy = (position_sample.y * self.crop_size[1] + self.crop_offset[1]) / self.full_resolution[1]
-        p2x = self.physical_extent.min_x + sx * (self.physical_extent.max_x - self.physical_extent.min_x)
-        p2y = self.physical_extent.min_y + sy * (self.physical_extent.max_y - self.physical_extent.min_y)
-        pfx, pfy = p2x, p2y
-        pupil, pdf, pupil_ok = self._sample_exit_pupil_vec(pfx, pfy, aperture_sample)
-        dfx, dfy, dfz = pupil.x - pfx, pupil.y - pfy, pupil.z
-        weight, ro, rd, lens_ok = self._trace_lenses_from_film_vec(pfx, pfy, 0.0, dfx, dfy, dfz, ray_wavelengths, active & pupil_ok)
-        d_norm = dr.normalize(mi.Vector3f(dfx, dfy, dfz))
+        pixel_sample = (position_sample.x > 1.0) | (position_sample.y > 1.0)
+        sx = dr.select(
+            pixel_sample,
+            (position_sample.x + self.crop_offset[0]) / self.full_resolution[0],
+            (position_sample.x * self.crop_size[0] + self.crop_offset[0]) / self.full_resolution[0],
+        )
+        sy = dr.select(
+            pixel_sample,
+            (position_sample.y + self.crop_offset[1]) / self.full_resolution[1],
+            (position_sample.y * self.crop_size[1] + self.crop_offset[1]) / self.full_resolution[1],
+        )
+
+        pfx = self.physical_extent.min_x + sx * (self.physical_extent.max_x - self.physical_extent.min_x)
+        pfy = self.physical_extent.min_y + sy * (self.physical_extent.max_y - self.physical_extent.min_y)
+        pupil, pdf, pupil_ok = self._sample_exit_pupil(pfx, pfy, aperture_sample)
+        d_film = mi.Vector3f(pupil.x - pfx, pupil.y - pfy, pupil.z)
+        wvl = ray_wavelengths[0] if ray_wavelengths.shape[0] > 0 else None
+
+        weight, ro, rd, lens_ok = self._trace_lenses(
+            pfx, pfy, 0.0,
+            d_film.x, d_film.y, d_film.z,
+            from_film=True,
+            wavelength=wvl,
+            active=active & pupil_ok,
+        )
+        if is_scalar_false(lens_ok):
+            return mi.Ray3f(), mi.Spectrum(0.0)
+
+        d_norm = dr.normalize(d_film)
         weight *= dr.power(d_norm.z, 4.0) / (pdf * self.lens_rear_z() * self.lens_rear_z())
         weight = dr.select(lens_ok, weight, 0.0)
-        
-        ray = mi.Ray3f(ro, dr.normalize(rd), time, ray_wavelengths)
-        ray = self.world_transform() @ ray
-        if ray_wavelengths.shape[0] > 0: # spectral rendering enabled: ray is warped according to first sampled wavelength
+        ray = self.world_transform() @ mi.Ray3f(ro, dr.normalize(rd), time, ray_wavelengths)
+        if ray_wavelengths.shape[0] > 0:
             ray_wav_weights[1:] = 0.0
             ray_wav_weights[0] *= 4.0
         return ray, ray_wav_weights * weight
@@ -415,97 +349,6 @@ class RealisticCamera(mi.Sensor):
         result.o_y, result.d_y = ry.o, ry.d
         result.has_differentials = True
         return result, weight
-
-    def _trace_lenses_from_film_vec(self, ox, oy, oz, dx, dy, dz, ray_wavelengths, active):
-        ox, oy, oz = ox, oy, -oz
-        dx, dy, dz = dx, dy, -dz
-        active = mi.Mask(active)
-        weight = mi.Float(1.0)
-        element_z = 0.0
-
-        for i in range(len(self.elements) - 1, -1, -1):
-            element = self.elements[i]
-            element_z -= element.thickness
-            is_stop = element.curvature_radius == 0
-            if is_stop:
-                denom_ok = dz != 0.0
-                t = (element_z - oz) / dr.select(denom_ok, dz, 1.0)
-                hit = denom_ok & (t >= -RAY_T_EPSILON)
-                nx = ny = nz = mi.Float(0.0)
-            else:
-                t, nx, ny, nz, hit = intersect_spherical_element_vec(
-                    element.curvature_radius, element_z + element.curvature_radius, ox, oy, oz, dx, dy, dz
-                )
-            hx, hy, hz = ox + t * dx, oy + t * dy, oz + t * dz
-            aperture_ok = hx * hx + hy * hy <= element.aperture_radius * element.aperture_radius
-            if is_stop and self._aperture_flat is not None:
-                aw = aperture_lookup_vec(
-                    self.aperture_image,
-                    self._aperture_flat,
-                    (hx / element.aperture_radius + 1.0) * 0.5,
-                    (hy / element.aperture_radius + 1.0) * 0.5,
-                )
-                weight = aw
-                aperture_ok = aw != 0.0
-            active &= hit & aperture_ok
-            ox, oy, oz = hx, hy, hz
-            if not is_stop:
-                wi = dr.normalize(mi.Vector3f(-dx, -dy, -dz))
-                if ray_wavelengths.shape[0] > 0:
-                    wvl = ray_wavelengths[0]
-                else:
-                    wvl = None                
-                eta_i = element.eta(wvl)
-                eta_t = self.elements[i - 1].eta(wvl) if i > 0 and self.elements[i - 1].eta(None)>0.0 else 1.0
-                wt, refr_ok = refract_vec(wi, mi.Vector3f(nx, ny, nz), eta_t / eta_i)
-                active &= refr_ok
-                dx, dy, dz = wt.x, wt.y, wt.z
-        return (
-            weight,
-            mi.Point3f(ox, oy, -oz),
-            mi.Vector3f(dx, dy, -dz),
-            active,
-        )
-
-    def _trace_lenses_from_film_np(self, ox, oy, oz, dx, dy, dz):
-        ox, oy, oz = ox.copy(), oy.copy(), -oz.copy()
-        dx, dy, dz = dx.copy(), dy.copy(), -dz.copy()
-        active = np.ones_like(ox, dtype=bool)
-        element_z = 0.0
-        for i in range(len(self.elements) - 1, -1, -1):
-            element = self.elements[i]
-            element_z -= element.thickness
-            if element.curvature_radius == 0:
-                denom_ok = dz != 0.0
-                t = (element_z - oz) / np.where(denom_ok, dz, 1.0)
-                hit = denom_ok & (t >= -RAY_T_EPSILON)
-                n = None
-            else:
-                t, n, hit = intersect_spherical_element_np(
-                    element.curvature_radius, element_z + element.curvature_radius, ox, oy, oz, dx, dy, dz
-                )
-            hx, hy, hz = ox + t * dx, oy + t * dy, oz + t * dz
-            aperture_ok = hx * hx + hy * hy <= element.aperture_radius * element.aperture_radius
-            if element.curvature_radius == 0 and self.aperture_image is not None:
-                aw = aperture_lookup_np(
-                    self.aperture_image,
-                    (hx / element.aperture_radius + 1.0) * 0.5,
-                    (hy / element.aperture_radius + 1.0) * 0.5,
-                )
-                aperture_ok = aw != 0.0
-            active &= hit & aperture_ok
-            ox, oy, oz = hx, hy, hz
-            if element.curvature_radius != 0:
-                inv_len = 1.0 / np.sqrt(dx * dx + dy * dy + dz * dz)
-                wi = (-dx * inv_len, -dy * inv_len, -dz * inv_len)
-                eta_i = element.eta(None)
-                eta_t = self.elements[i - 1].eta(None) if i > 0 and self.elements[i - 1].eta(None)>0.0 else 1.0
-                wt, ok = refract_np(wi, n, eta_t / eta_i)
-                
-                active &= ok
-                dx, dy, dz = wt
-        return active
-
 
     def to_string(self):
         return (

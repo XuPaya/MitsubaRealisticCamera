@@ -12,9 +12,6 @@ start = time.time()
 scene = mi.load_file(
     'scenes/kitchen/scene_realistic_fisheye.xml'
 )
-# scene = mi.load_file(
-#     'scenes/debug/scene.xml'
-# )
 
 n_trials = 16
 

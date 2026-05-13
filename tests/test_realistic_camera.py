@@ -9,7 +9,7 @@ import numpy as np
 mi.set_variant("scalar_rgb")
 
 import RealisticCamera  # noqa: E402
-from utils import intersect_spherical_element, load_lens_file, refract  # noqa: E402
+from utils import ApertureStop, SphericalSurface, intersect_spherical_element, load_lens_file, refract  # noqa: E402
 
 
 LENS = "scenes/kitchen/lenses/fisheye.10mm.dat"
@@ -53,6 +53,8 @@ class TestRealisticCamera(unittest.TestCase):
     def test_aperture_clamping_and_film_extent(self):
         sensor = make_sensor(aperture_diameter=8.0)
         stop = next(e for e in sensor.elements if e.curvature_radius == 0)
+        self.assertIsInstance(sensor.elements[0].surface, SphericalSurface)
+        self.assertIsInstance(stop.surface, ApertureStop)
         self.assertAlmostEqual(stop.aperture_radius, 0.5 * 6.08e-3)
         expected_width = 0.035 / math.sqrt(1.0 + (36 / 64) ** 2)
         self.assertAlmostEqual(
