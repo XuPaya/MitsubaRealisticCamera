@@ -60,7 +60,7 @@ XML sensor example:
 </sensor>
 ```
 
-Note that the we support lens data stored as .dat files, with additional support of glass name lookup for spectral rendering. See the scene in `examples/scenes/kitchen` for an example usage. 
+Note that the we support lens data stored as .dat files, with additional support of glass name lookup for spectral rendering. See the scene in `examples/scenes/kitchen` for an example usage. The model and texture files can be found from [Benedikt Bitterli's website](https://benedikt-bitterli.me/resources/).
 
 ## Examples
 
