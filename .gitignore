@@ -1,5 +1,10 @@
 outputs
-scenes/*
+examples/scenes/*
+!examples/scenes/kitchen/
+examples/scenes/kitchen/models
+examples/scenes/kitchen/textures
+!examples/scenes/kitchen/*.xml
+!examples/scenes/kitchen/lenses
 *.pdf
 .vscode
 __pycache__/

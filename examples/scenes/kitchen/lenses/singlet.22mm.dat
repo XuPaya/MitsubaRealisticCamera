@@ -1,0 +1,7 @@
+# Bad chromatic-aberration wide-angle test lens
+# Single SF7 biconvex lens, roughly 22-24mm focal length
+# Not a corrected photographic lens.
+# radius    thickness   eta/material   aperture_radius
+0.0         1.500       0.0            11.0
+30.000      4.000       SF7            16.0
+-30.000     24.000      1.0            16.0

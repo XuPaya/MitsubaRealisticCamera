@@ -1,0 +1,7 @@
+# Bad chromatic-aberration test lens
+# Single SF7 biconvex lens with large aperture
+# Not a real corrected photographic lens.
+# radius    thickness   eta/material   aperture_radius
+0.0         2.000       0.0            18.0
+65.000      6.000       SF7            22.0
+-65.000     55.000      1.0            22.0
