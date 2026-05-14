@@ -14,10 +14,10 @@
 				target="0.61, 1.7030797, 2.95443"
 				up="-0.0182716, 0.999131, -0.0374507" />
 		</transform>
-		<string name="lens_file" value="lenses/dgauss.50mm.dat" />
+		<string name="lens_file" value="lenses/JP2022-033487_Example01P.zmx" />
 		<string name="lens_directory" value="scenes/kitchen" />
-		<float name="aperture_diameter" value="160.0" />
-		<float name="focus_distance" value="3.0" />
+		<!-- <float name="aperture_diameter" value="160.0" /> -->
+		<float name="focus_distance" value="7.0" />
 		<float name="film_diagonal" value="35.0" />
 		<float name="mm_to_world" value="0.001" />
 		<boolean name="use_exit_pupil" value="true" />

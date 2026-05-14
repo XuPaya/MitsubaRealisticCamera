@@ -20,9 +20,8 @@ class RealisticCamera(mi.Sensor):
             raise ValueError("realisticcamera requires a lens_file string")
 
         self.lens_file = resolve_file(lens_file, lens_directory)
-        self.aperture_diameter = float(
-            get_property(props, ("aperture_diameter", "aperturediameter"), 1.0)
-        )
+        aperture_diameter = get_property(props, ("aperture_diameter", "aperturediameter"), None)
+        self.aperture_diameter = float(aperture_diameter) if aperture_diameter is not None else 1.0
         self.focus_distance = float(get_property(props, ("focus_distance", "focusdistance"), 10.0))
         self.film_diagonal = float(get_property(props, ("film_diagonal",), 35.0))
         self.mm_to_world = float(get_property(props, ("mm_to_world",), 0.001))
@@ -35,7 +34,9 @@ class RealisticCamera(mi.Sensor):
         self._radical_inverse = mi.RadicalInverse(3)
         self.elements = load_lens_elements(
             self.lens_file,
-            self.aperture_diameter,
+            self.aperture_diameter
+            if aperture_diameter is not None or self.lens_file.suffix.lower() != ".zmx"
+            else None,
             self.mm_to_world,
         )
         self._aperture_flat = (

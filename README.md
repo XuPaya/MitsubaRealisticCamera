@@ -6,9 +6,9 @@ currently selected Mitsuba variant.
 
 The implementation loads PBRT lens `.dat` files, traces rays through the lens
 stack, supports aperture stops/masks, exit-pupil sampling, thick-lens focusing,
-and wavelength-dependent glass data for spectral rendering. Lens surfaces are
-represented by a small extensible interface, so additional surface models such
-as Zemax `EVENASPH` can be added without rewriting the camera trace loop.
+and wavelength-dependent glass data for spectral rendering.
+
+Note that we have NOT validated the implementation against real camera data, nor geometric MTFs provided by lens manufacturers.
 
 ## Installation
 The project was built and tested with Python 3.10 on Windows 10, with dependencies on:
@@ -61,6 +61,10 @@ XML sensor example:
 ```
 
 Note that the we support lens data stored as .dat files, with additional support of glass name lookup for spectral rendering. See the scene in `examples/scenes/kitchen` for an example usage. The model and texture files can be found from [Benedikt Bitterli's website](https://benedikt-bitterli.me/resources/).
+
+### Additional Features
+
+- Limited .zmx support: A subset of glass catagories and lens surface form .zmx files are supported and can be loaded by specifying the `lens_file` attribute. Note that new glass types can be added by extending the glass dictionary.
 
 ## Examples
 
@@ -116,8 +120,9 @@ For spectral variants, the example script marks monochrome bitmap maps such as
 opacity/bump masks as `raw=true`, which avoids Mitsuba treating the same bitmap
 as both a spectrum and a scalar texture.
 
-## Limitations and Planned Features
+## Limitations
 - The project currently does not support flare and diffraction effects.
-- The lens is limited to spherical and axis-aligned surfaces. Support for aspherical and freeform surfaces is planned for a future updates.
-- The lens data format is currently limited to PBRT .dat files, with support for Zemax lens files planned for the future.
+- The lens is limited to axis-centered surfaces.
+- Auto-differentiation through the lens trace is not supported.
+
 
